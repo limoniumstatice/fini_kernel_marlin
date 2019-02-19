@@ -1175,7 +1175,23 @@ void write_data_page(struct page *page, struct dnode_of_data *dn,
 	get_node_info(sbi, dn->nid, &ni);
 	set_summary(&sum, dn->nid, dn->ofs_in_node, ni.version);
 
-	do_write_page(sbi, page, dn->data_blkaddr, new_blkaddr, &sum, fio);
+	if (!IS_DATASEG(get_seg_entry(sbi, segno)->type)) {
+		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		return -EFAULT;
+	}
+
+	stat_inc_inplace_blocks(fio->sbi);
+
+	if (fio->bio)
+		err = f2fs_merge_page_bio(fio);
+	else
+		err = f2fs_submit_page_bio(fio);
+	if (!err) {
+		update_device_state(fio);
+		f2fs_update_iostat(fio->sbi, fio->io_type, F2FS_BLKSIZE);
+	}
+
+	return err;
 }
 
 void rewrite_data_page(struct page *page, block_t old_blkaddr,
