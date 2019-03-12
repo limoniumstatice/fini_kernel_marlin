@@ -2207,11 +2207,18 @@ struct diag_dci_client_tbl *dci_lookup_client_entry_pid(int tgid)
 			DIAG_LOG(DIAG_DEBUG_DCI,
 				"diag: valid task doesn't exist for pid = %d\n",
 				entry->tgid);
+			put_pid(pid_struct);
 			continue;
 		}
-		if (task_s == entry->client)
-			if (entry->client->tgid == tgid)
+		if (task_s == entry->client) {
+			if (entry->client->tgid == tgid) {
+				put_task_struct(task_s);
+				put_pid(pid_struct);
 				return entry;
+			}
+		}
+		put_task_struct(task_s);
+		put_pid(pid_struct);
 	}
 	return NULL;
 }
