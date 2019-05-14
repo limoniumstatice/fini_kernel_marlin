@@ -1002,7 +1002,35 @@ retry:
 		goto retry;
 	}
 
-	return entry;
+	return bio_alloc(GFP_KERNEL, npages);
+}
+
+static inline bool is_idle(struct f2fs_sb_info *sbi, int type)
+{
+	if (sbi->gc_mode == GC_URGENT)
+		return true;
+
+	if (get_pages(sbi, F2FS_RD_DATA) || get_pages(sbi, F2FS_RD_NODE) ||
+		get_pages(sbi, F2FS_RD_META) || get_pages(sbi, F2FS_WB_DATA) ||
+		get_pages(sbi, F2FS_WB_CP_DATA))
+		return false;
+
+	if (SM_I(sbi) && SM_I(sbi)->dcc_info &&
+			atomic_read(&SM_I(sbi)->dcc_info->queued_discard))
+		return false;
+
+	if (SM_I(sbi) && SM_I(sbi)->fcc_info &&
+			atomic_read(&SM_I(sbi)->fcc_info->queued_flush))
+		return false;
+
+	return f2fs_time_over(sbi, type);
+}
+
+static inline void f2fs_radix_tree_insert(struct radix_tree_root *root,
+				unsigned long index, void *item)
+{
+	while (radix_tree_insert(root, index, item))
+		cond_resched();
 }
 
 #define RAW_IS_INODE(p)	((p)->footer.nid == (p)->footer.ino)
