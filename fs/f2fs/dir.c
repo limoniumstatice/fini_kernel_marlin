@@ -659,6 +659,86 @@ bool f2fs_empty_dir(struct inode *dir)
 	return true;
 }
 
+int f2fs_fill_dentries(struct dir_context *ctx, struct f2fs_dentry_ptr *d,
+			unsigned int start_pos, struct fscrypt_str *fstr)
+{
+	unsigned char d_type = DT_UNKNOWN;
+	unsigned int bit_pos;
+	struct f2fs_dir_entry *de = NULL;
+	struct fscrypt_str de_name = FSTR_INIT(NULL, 0);
+	struct f2fs_sb_info *sbi = F2FS_I_SB(d->inode);
+	struct blk_plug plug;
+	bool readdir_ra = sbi->readdir_ra == 1;
+	int err = 0;
+
+	bit_pos = ((unsigned long)ctx->pos % d->max);
+
+	if (readdir_ra)
+		blk_start_plug(&plug);
+
+	while (bit_pos < d->max) {
+		bit_pos = find_next_bit_le(d->bitmap, d->max, bit_pos);
+		if (bit_pos >= d->max)
+			break;
+
+		de = &d->dentry[bit_pos];
+		if (de->name_len == 0) {
+			bit_pos++;
+			ctx->pos = start_pos + bit_pos;
+			printk_ratelimited(
+				"%s, invalid namelen(0), ino:%u, run fsck to fix.",
+				KERN_WARNING, le32_to_cpu(de->ino));
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			continue;
+		}
+
+		d_type = f2fs_get_de_type(de);
+
+		de_name.name = d->filename[bit_pos];
+		de_name.len = le16_to_cpu(de->name_len);
+
+		/* check memory boundary before moving forward */
+		bit_pos += GET_DENTRY_SLOTS(le16_to_cpu(de->name_len));
+		if (unlikely(bit_pos > d->max ||
+				le16_to_cpu(de->name_len) > F2FS_NAME_LEN)) {
+			f2fs_msg(sbi->sb, KERN_WARNING,
+				"%s: corrupted namelen=%d, run fsck to fix.",
+				__func__, le16_to_cpu(de->name_len));
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			err = -EINVAL;
+			goto out;
+		}
+
+		if (f2fs_encrypted_inode(d->inode)) {
+			int save_len = fstr->len;
+
+			err = fscrypt_fname_disk_to_usr(d->inode,
+						(u32)le32_to_cpu(de->hash_code),
+						0, &de_name, fstr);
+			if (err)
+				goto out;
+
+			de_name = *fstr;
+			fstr->len = save_len;
+		}
+
+		if (!dir_emit(ctx, de_name.name, de_name.len,
+					le32_to_cpu(de->ino), d_type)) {
+			err = 1;
+			goto out;
+		}
+
+		if (readdir_ra)
+			f2fs_ra_node_page(sbi, le32_to_cpu(de->ino));
+
+		ctx->pos = start_pos + bit_pos;
+	}
+out:
+	if (readdir_ra)
+		blk_finish_plug(&plug);
+	return err;
+}
+
 static int f2fs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
