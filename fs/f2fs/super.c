@@ -1662,6 +1662,18 @@ int f2fs_quota_sync(struct super_block *sb, int type)
 	int cnt;
 	int ret;
 
+	/*
+	 * do_quotactl
+	 *  f2fs_quota_sync
+	 *  down_read(quota_sem)
+	 *  dquot_writeback_dquots()
+	 *  f2fs_dquot_commit
+	 *                            block_operation
+	 *                            down_read(quota_sem)
+	 */
+	f2fs_lock_op(sbi);
+
+	down_read(&sbi->quota_sem);
 	ret = dquot_writeback_dquots(sb, type);
 	if (ret)
 		goto out;
@@ -1696,9 +1708,16 @@ int f2fs_quota_sync(struct super_block *sb, int type)
 	kobject_put(&sbi->s_kobj);
 	wait_for_completion(&sbi->s_kobj_unregister);
 
-	sb->s_fs_info = NULL;
-	brelse(sbi->raw_super_buf);
-	kfree(sbi);
+		inode_lock(dqopt->files[cnt]);
+		truncate_inode_pages(&dqopt->files[cnt]->i_data, 0);
+		inode_unlock(dqopt->files[cnt]);
+	}
+out:
+	if (ret)
+		set_sbi_flag(F2FS_SB(sb), SBI_QUOTA_NEED_REPAIR);
+	up_read(&sbi->quota_sem);
+	f2fs_unlock_op(sbi);
+	return ret;
 }
 
 int f2fs_sync_fs(struct super_block *sb, int sync)
@@ -1767,79 +1786,72 @@ static int f2fs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_files = sbi->total_node_count - F2FS_RESERVED_NODE_NUM;
 	buf->f_ffree = buf->f_files - valid_inode_count(sbi);
 
-	buf->f_namelen = F2FS_NAME_LEN;
-	buf->f_fsid.val[0] = (u32)id;
-	buf->f_fsid.val[1] = (u32)(id >> 32);
+static int f2fs_dquot_commit(struct dquot *dquot)
+{
+	struct f2fs_sb_info *sbi = F2FS_SB(dquot->dq_sb);
+	int ret;
 
-	return 0;
+	down_read(&sbi->quota_sem);
+	ret = dquot_commit(dquot);
+	if (ret < 0)
+		set_sbi_flag(sbi, SBI_QUOTA_NEED_REPAIR);
+	up_read(&sbi->quota_sem);
+	return ret;
 }
 
 static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 {
-	struct f2fs_sb_info *sbi = F2FS_SB(root->d_sb);
+	struct f2fs_sb_info *sbi = F2FS_SB(dquot->dq_sb);
+	int ret;
 
-	if (!f2fs_readonly(sbi->sb) && test_opt(sbi, BG_GC))
-		seq_printf(seq, ",background_gc=%s", "on");
-	else
-		seq_printf(seq, ",background_gc=%s", "off");
-	if (test_opt(sbi, DISABLE_ROLL_FORWARD))
-		seq_puts(seq, ",disable_roll_forward");
-	if (test_opt(sbi, DISCARD))
-		seq_puts(seq, ",discard");
-	if (test_opt(sbi, NOHEAP))
-		seq_puts(seq, ",no_heap_alloc");
-#ifdef CONFIG_F2FS_FS_XATTR
-	if (test_opt(sbi, XATTR_USER))
-		seq_puts(seq, ",user_xattr");
-	else
-		seq_puts(seq, ",nouser_xattr");
-	if (test_opt(sbi, INLINE_XATTR))
-		seq_puts(seq, ",inline_xattr");
-#endif
-#ifdef CONFIG_F2FS_FS_POSIX_ACL
-	if (test_opt(sbi, POSIX_ACL))
-		seq_puts(seq, ",acl");
-	else
-		seq_puts(seq, ",noacl");
-#endif
-	if (test_opt(sbi, DISABLE_EXT_IDENTIFY))
-		seq_puts(seq, ",disable_ext_identify");
-	if (test_opt(sbi, INLINE_DATA))
-		seq_puts(seq, ",inline_data");
-	if (!f2fs_readonly(sbi->sb) && test_opt(sbi, FLUSH_MERGE))
-		seq_puts(seq, ",flush_merge");
-	if (test_opt(sbi, NOBARRIER))
-		seq_puts(seq, ",nobarrier");
-	seq_printf(seq, ",active_logs=%u", sbi->active_logs);
+	down_read(&sbi->quota_sem);
+	ret = dquot_acquire(dquot);
+	if (ret < 0)
+		set_sbi_flag(sbi, SBI_QUOTA_NEED_REPAIR);
+	up_read(&sbi->quota_sem);
+	return ret;
+}
 
-	return 0;
+static int f2fs_dquot_release(struct dquot *dquot)
+{
+	struct f2fs_sb_info *sbi = F2FS_SB(dquot->dq_sb);
+	int ret;
+
+	down_read(&sbi->quota_sem);
+	ret = dquot_release(dquot);
+	if (ret < 0)
+		set_sbi_flag(sbi, SBI_QUOTA_NEED_REPAIR);
+	up_read(&sbi->quota_sem);
+	return ret;
 }
 
 static int segment_info_seq_show(struct seq_file *seq, void *offset)
 {
 	struct super_block *sb = seq->private;
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
-	unsigned int total_segs =
-			le32_to_cpu(sbi->raw_super->segment_count_main);
-	int i;
+	int ret;
+
+	down_read(&sbi->quota_sem);
+	ret = dquot_mark_dquot_dirty(dquot);
 
 	seq_puts(seq, "format: segment_type|valid_blocks\n"
 		"segment_type(0:HD, 1:WD, 2:CD, 3:HN, 4:WN, 5:CN)\n");
 
-	for (i = 0; i < total_segs; i++) {
-		struct seg_entry *se = get_seg_entry(sbi, i);
+	up_read(&sbi->quota_sem);
+	return ret;
+}
 
-		if ((i % 10) == 0)
-			seq_printf(seq, "%-5d", i);
-		seq_printf(seq, "%d|%-3u", se->type,
-					get_valid_blocks(sbi, i, 1));
-		if ((i % 10) == 9 || i == (total_segs - 1))
-			seq_putc(seq, '\n');
-		else
-			seq_putc(seq, ' ');
-	}
+static int f2fs_dquot_commit_info(struct super_block *sb, int type)
+{
+	struct f2fs_sb_info *sbi = F2FS_SB(sb);
+	int ret;
 
-	return 0;
+	down_read(&sbi->quota_sem);
+	ret = dquot_commit_info(sb, type);
+	if (ret < 0)
+		set_sbi_flag(sbi, SBI_QUOTA_NEED_REPAIR);
+	up_read(&sbi->quota_sem);
+	return ret;
 }
 
 static int segment_info_open_fs(struct inode *inode, struct file *file)
@@ -2651,6 +2663,7 @@ try_onemore:
 	}
 
 	init_rwsem(&sbi->cp_rwsem);
+	init_rwsem(&sbi->quota_sem);
 	init_waitqueue_head(&sbi->cp_wait);
 	init_sb_info(sbi);
 
