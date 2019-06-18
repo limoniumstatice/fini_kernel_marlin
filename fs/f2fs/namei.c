@@ -170,7 +170,56 @@ struct dentry *f2fs_get_parent(struct dentry *child)
 	unsigned long ino = f2fs_inode_by_name(child->d_inode, &dotdot);
 	if (!ino)
 		return ERR_PTR(-ENOENT);
-	return d_obtain_alias(f2fs_iget(child->d_inode->i_sb, ino));
+	}
+	return d_obtain_alias(f2fs_iget(child->d_sb, ino));
+}
+
+static int __recover_dot_dentries(struct inode *dir, nid_t pino)
+{
+	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
+	struct qstr dot = QSTR_INIT(".", 1);
+	struct qstr dotdot = QSTR_INIT("..", 2);
+	struct f2fs_dir_entry *de;
+	struct page *page;
+	int err = 0;
+
+	if (f2fs_readonly(sbi->sb)) {
+		f2fs_info(sbi, "skip recovering inline_dots inode (ino:%lu, pino:%u) in readonly mountpoint",
+			  dir->i_ino, pino);
+		return 0;
+	}
+
+	dquot_initialize(dir);
+
+	f2fs_balance_fs(sbi, true);
+
+	f2fs_lock_op(sbi);
+
+	de = f2fs_find_entry(dir, &dot, &page);
+	if (de) {
+		f2fs_put_page(page, 0);
+	} else if (IS_ERR(page)) {
+		err = PTR_ERR(page);
+		goto out;
+	} else {
+		err = f2fs_do_add_link(dir, &dot, NULL, dir->i_ino, S_IFDIR);
+		if (err)
+			goto out;
+	}
+
+	de = f2fs_find_entry(dir, &dotdot, &page);
+	if (de)
+		f2fs_put_page(page, 0);
+	else if (IS_ERR(page))
+		err = PTR_ERR(page);
+	else
+		err = f2fs_do_add_link(dir, &dotdot, NULL, pino, S_IFDIR);
+out:
+	if (!err)
+		clear_inode_flag(dir, FI_INLINE_DOTS);
+
+	f2fs_unlock_op(sbi);
+	return err;
 }
 
 static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
@@ -196,7 +245,30 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		stat_inc_inline_inode(inode);
 	}
 
-	return d_splice_alias(inode, dentry);
+	if (f2fs_has_inline_dots(inode)) {
+		err = __recover_dot_dentries(inode, dir->i_ino);
+		if (err)
+			goto out_iput;
+	}
+	if (f2fs_encrypted_inode(dir) &&
+	    (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode)) &&
+	    !fscrypt_has_permitted_context(dir, inode)) {
+		f2fs_warn(F2FS_I_SB(inode), "Inconsistent encryption contexts: %lu/%lu",
+			  dir->i_ino, inode->i_ino);
+		err = -EPERM;
+		goto out_iput;
+	}
+out_splice:
+	new = d_splice_alias(inode, dentry);
+	if (IS_ERR(new))
+		err = PTR_ERR(new);
+	trace_f2fs_lookup_end(dir, dentry, ino, err);
+	return new;
+out_iput:
+	iput(inode);
+out:
+	trace_f2fs_lookup_end(dir, dentry, ino, err);
+	return ERR_PTR(err);
 }
 
 static int f2fs_unlink(struct inode *dir, struct dentry *dentry)

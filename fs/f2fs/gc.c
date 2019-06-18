@@ -519,8 +519,9 @@ static int check_dnode(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	get_node_info(sbi, nid, dni);
 
 	if (sum->version != dni->version) {
-		f2fs_put_page(node_page, 1);
-		return 0;
+		f2fs_warn(sbi, "%s: valid data with mismatched node version.",
+			  __func__);
+		set_sbi_flag(sbi, SBI_NEED_FSCK);
 	}
 
 	*nofs = ofs_of_node(node_page);
@@ -680,7 +681,51 @@ static void do_garbage_collect(struct f2fs_sb_info *sbi, unsigned int segno,
 
 	blk_start_plug(&plug);
 
-	sum = page_address(sum_page);
+	for (segno = start_segno; segno < end_segno; segno++) {
+
+		/* find segment summary of victim */
+		sum_page = find_get_page(META_MAPPING(sbi),
+					GET_SUM_BLOCK(sbi, segno));
+		f2fs_put_page(sum_page, 0);
+
+		if (get_valid_blocks(sbi, segno, false) == 0)
+			goto freed;
+		if (__is_large_section(sbi) &&
+				migrated >= sbi->migration_granularity)
+			goto skip;
+		if (!PageUptodate(sum_page) || unlikely(f2fs_cp_error(sbi)))
+			goto skip;
+
+		sum = page_address(sum_page);
+		if (type != GET_SUM_TYPE((&sum->footer))) {
+			f2fs_err(sbi, "Inconsistent segment (%u) type [%d, %d] in SSA and SIT",
+				 segno, type, GET_SUM_TYPE((&sum->footer)));
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			f2fs_stop_checkpoint(sbi, false);
+			goto skip;
+		}
+
+		/*
+		 * this is to avoid deadlock:
+		 * - lock_page(sum_page)         - f2fs_replace_block
+		 *  - check_valid_map()            - down_write(sentry_lock)
+		 *   - down_read(sentry_lock)     - change_curseg()
+		 *                                  - lock_page(sum_page)
+		 */
+		if (type == SUM_TYPE_NODE)
+			submitted += gc_node_segment(sbi, sum->entries, segno,
+								gc_type);
+		else
+			submitted += gc_data_segment(sbi, sum->entries, gc_list,
+							segno, gc_type);
+
+		stat_inc_seg_count(sbi, type, gc_type);
+
+freed:
+		if (gc_type == FG_GC &&
+				get_valid_blocks(sbi, segno, false) == 0)
+			seg_freed++;
+		migrated++;
 
 	switch (GET_SUM_TYPE((&sum->footer))) {
 	case SUM_TYPE_NODE:
@@ -803,8 +848,8 @@ static int free_segment_range(struct f2fs_sb_info *sbi, unsigned int start,
 
 	next_inuse = find_next_inuse(FREE_I(sbi), end + 1, start);
 	if (next_inuse <= end) {
-		f2fs_msg(sbi->sb, KERN_ERR,
-			"segno %u should be free but still inuse!", next_inuse);
+		f2fs_err(sbi, "segno %u should be free but still inuse!",
+			 next_inuse);
 		f2fs_bug_on(sbi, 1);
 	}
 	return err;
@@ -861,14 +906,12 @@ int f2fs_resize_fs(struct f2fs_sb_info *sbi, __u64 block_count)
 		return 0;
 
 	if (is_sbi_flag_set(sbi, SBI_NEED_FSCK)) {
-		f2fs_msg(sbi->sb, KERN_ERR,
-			"Should run fsck to repair first.");
+		f2fs_err(sbi, "Should run fsck to repair first.");
 		return -EINVAL;
 	}
 
 	if (test_opt(sbi, DISABLE_CHECKPOINT)) {
-		f2fs_msg(sbi->sb, KERN_ERR,
-			"Checkpoint should be enabled.");
+		f2fs_err(sbi, "Checkpoint should be enabled.");
 		return -EINVAL;
 	}
 
@@ -932,8 +975,7 @@ int f2fs_resize_fs(struct f2fs_sb_info *sbi, __u64 block_count)
 out:
 	if (err) {
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
-		f2fs_msg(sbi->sb, KERN_ERR,
-				"resize_fs failed, should run fsck to repair!");
+		f2fs_err(sbi, "resize_fs failed, should run fsck to repair!");
 
 		MAIN_SECS(sbi) += secs;
 		spin_lock(&sbi->stat_lock);
