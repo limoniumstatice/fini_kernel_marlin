@@ -399,11 +399,35 @@ static void __remove_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno,
  */
 static void locate_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno)
 {
-	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
-	unsigned short valid_blocks;
+	sector_t sector, nr_sects;
+	block_t lblkstart = blkstart;
+	int devi = 0;
 
-	if (segno == NULL_SEGNO || IS_CURSEG(sbi, segno))
-		return;
+	if (f2fs_is_multi_device(sbi)) {
+		devi = f2fs_target_device_index(sbi, blkstart);
+		if (blkstart < FDEV(devi).start_blk ||
+		    blkstart > FDEV(devi).end_blk) {
+			f2fs_err(sbi, "Invalid block %x", blkstart);
+			return -EIO;
+		}
+		blkstart -= FDEV(devi).start_blk;
+	}
+
+	/* For sequential zones, reset the zone write pointer */
+	if (f2fs_blkz_is_seq(sbi, devi, blkstart)) {
+		sector = SECTOR_FROM_BLOCK(blkstart);
+		nr_sects = SECTOR_FROM_BLOCK(blklen);
+
+		if (sector & (bdev_zone_sectors(bdev) - 1) ||
+				nr_sects != bdev_zone_sectors(bdev)) {
+			f2fs_err(sbi, "(%d) %s: Unaligned zone reset attempted (block %x + %x)",
+				 devi, sbi->s_ndevs ? FDEV(devi).path : "",
+				 blkstart, blklen);
+			return -EIO;
+		}
+		trace_f2fs_issue_reset_zone(bdev, blkstart);
+		return blkdev_reset_zones(bdev, sector, nr_sects, GFP_NOFS);
+	}
 
 	mutex_lock(&dirty_i->seglist_lock);
 
@@ -620,10 +644,34 @@ static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 
 	/* Update valid block bitmap */
 	if (del > 0) {
-		if (f2fs_set_bit(offset, se->cur_valid_map))
+		exist = f2fs_test_and_set_bit(offset, se->cur_valid_map);
+#ifdef CONFIG_F2FS_CHECK_FS
+		mir_exist = f2fs_test_and_set_bit(offset,
+						se->cur_valid_map_mir);
+		if (unlikely(exist != mir_exist)) {
+			f2fs_err(sbi, "Inconsistent error when setting bitmap, blk:%u, old bit:%d",
+				 blkaddr, exist);
+			f2fs_bug_on(sbi, 1);
+		}
+#endif
+		if (unlikely(exist)) {
+			f2fs_err(sbi, "Bitmap was wrongly set, blk:%u",
+				 blkaddr);
 			f2fs_bug_on(sbi, 1);
 	} else {
-		if (!f2fs_clear_bit(offset, se->cur_valid_map))
+		exist = f2fs_test_and_clear_bit(offset, se->cur_valid_map);
+#ifdef CONFIG_F2FS_CHECK_FS
+		mir_exist = f2fs_test_and_clear_bit(offset,
+						se->cur_valid_map_mir);
+		if (unlikely(exist != mir_exist)) {
+			f2fs_err(sbi, "Inconsistent error when clearing bitmap, blk:%u, old bit:%d",
+				 blkaddr, exist);
+			f2fs_bug_on(sbi, 1);
+		}
+#endif
+		if (unlikely(!exist)) {
+			f2fs_err(sbi, "Bitmap was wrongly cleared, blk:%u",
+				 blkaddr);
 			f2fs_bug_on(sbi, 1);
 	}
 	if (!f2fs_test_bit(offset, se->ckpt_valid_map))
@@ -1001,9 +1049,8 @@ unlock:
 	up_write(&SIT_I(sbi)->sentry_lock);
 
 	if (segno != curseg->segno)
-		f2fs_msg(sbi->sb, KERN_NOTICE,
-			"For resize: curseg of type %d: %u ==> %u",
-			type, segno, curseg->segno);
+		f2fs_notice(sbi, "For resize: curseg of type %d: %u ==> %u",
+			    type, segno, curseg->segno);
 
 	mutex_unlock(&curseg->curseg_mutex);
 	up_read(&SM_I(sbi)->curseg_lock);
@@ -1038,8 +1085,29 @@ int f2fs_trim_fs(struct f2fs_sb_info *sbi, struct fstrim_range *range)
 						range->len < sbi->blocksize)
 		return -EINVAL;
 
-	cpc.trimmed = 0;
-	if (end <= MAIN_BLKADDR(sbi))
+	if (end < MAIN_BLKADDR(sbi))
+		goto out;
+
+	if (is_sbi_flag_set(sbi, SBI_NEED_FSCK)) {
+		f2fs_warn(sbi, "Found FS corruption, run fsck to fix.");
+		return -EIO;
+	}
+
+	/* start/end segment number in main_area */
+	start_segno = (start <= MAIN_BLKADDR(sbi)) ? 0 : GET_SEGNO(sbi, start);
+	end_segno = (end >= MAX_BLKADDR(sbi)) ? MAIN_SEGS(sbi) - 1 :
+						GET_SEGNO(sbi, end);
+	if (need_align) {
+		start_segno = rounddown(start_segno, sbi->segs_per_sec);
+		end_segno = roundup(end_segno + 1, sbi->segs_per_sec) - 1;
+	}
+
+	cpc.reason = CP_DISCARD;
+	cpc.trim_minlen = max_t(__u64, 1, F2FS_BYTES_TO_BLK(range->minlen));
+	cpc.trim_start = start_segno;
+	cpc.trim_end = end_segno;
+
+	if (sbi->discard_blks == 0)
 		goto out;
 
 	/* start/end segment number in main_area */
@@ -1440,6 +1508,14 @@ static int restore_curseg_summaries(struct f2fs_sb_info *sbi)
 		err = read_normal_summaries(sbi, type);
 		if (err)
 			return err;
+	}
+
+	/* sanity check for summary blocks */
+	if (nats_in_cursum(nat_j) > NAT_JOURNAL_ENTRIES ||
+			sits_in_cursum(sit_j) > SIT_JOURNAL_ENTRIES) {
+		f2fs_err(sbi, "invalid journal entries nats %u sits %u\n",
+			 nats_in_cursum(nat_j), sits_in_cursum(sit_j));
+		return -EINVAL;
 	}
 
 	return 0;
@@ -1961,6 +2037,60 @@ got_it:
 		}
 		start_blk += readed;
 	} while (start_blk < sit_blk_cnt);
+
+	down_read(&curseg->journal_rwsem);
+	for (i = 0; i < sits_in_cursum(journal); i++) {
+		unsigned int old_valid_blocks;
+
+		start = le32_to_cpu(segno_in_journal(journal, i));
+		if (start >= MAIN_SEGS(sbi)) {
+			f2fs_err(sbi, "Wrong journal entry on segno %u",
+				 start);
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			err = -EINVAL;
+			break;
+		}
+
+		se = &sit_i->sentries[start];
+		sit = sit_in_journal(journal, i);
+
+		old_valid_blocks = se->valid_blocks;
+		if (IS_NODESEG(se->type))
+			total_node_blocks -= old_valid_blocks;
+
+		err = check_block_count(sbi, start, &sit);
+		if (err)
+			break;
+		seg_info_from_raw_sit(se, &sit);
+		if (IS_NODESEG(se->type))
+			total_node_blocks += se->valid_blocks;
+
+		if (is_set_ckpt_flags(sbi, CP_TRIMMED_FLAG)) {
+			memset(se->discard_map, 0xff, SIT_VBLOCK_MAP_SIZE);
+		} else {
+			memcpy(se->discard_map, se->cur_valid_map,
+						SIT_VBLOCK_MAP_SIZE);
+			sbi->discard_blks += old_valid_blocks;
+			sbi->discard_blks -= se->valid_blocks;
+		}
+
+		if (__is_large_section(sbi)) {
+			get_sec_entry(sbi, start)->valid_blocks +=
+							se->valid_blocks;
+			get_sec_entry(sbi, start)->valid_blocks -=
+							old_valid_blocks;
+		}
+	}
+	up_read(&curseg->journal_rwsem);
+
+	if (!err && total_node_blocks != valid_node_count(sbi)) {
+		f2fs_err(sbi, "SIT is corrupted node# %u vs %u",
+			 total_node_blocks, valid_node_count(sbi));
+		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		err = -EINVAL;
+	}
+
+	return err;
 }
 
 static void init_free_segmap(struct f2fs_sb_info *sbi)
@@ -2041,6 +2171,39 @@ static int build_dirty_segmap(struct f2fs_sb_info *sbi)
 
 	init_dirty_segmap(sbi);
 	return init_victim_secmap(sbi);
+}
+
+static int sanity_check_curseg(struct f2fs_sb_info *sbi)
+{
+	int i;
+
+	/*
+	 * In LFS/SSR curseg, .next_blkoff should point to an unused blkaddr;
+	 * In LFS curseg, all blkaddr after .next_blkoff should be unused.
+	 */
+	for (i = 0; i < NO_CHECK_TYPE; i++) {
+		struct curseg_info *curseg = CURSEG_I(sbi, i);
+		struct seg_entry *se = get_seg_entry(sbi, curseg->segno);
+		unsigned int blkofs = curseg->next_blkoff;
+
+		if (f2fs_test_bit(blkofs, se->cur_valid_map))
+			goto out;
+
+		if (curseg->alloc_type == SSR)
+			continue;
+
+		for (blkofs += 1; blkofs < sbi->blocks_per_seg; blkofs++) {
+			if (!f2fs_test_bit(blkofs, se->cur_valid_map))
+				continue;
+out:
+			f2fs_err(sbi,
+				 "Current segment's next free block offset is inconsistent with bitmap, logtype:%u, segno:%u, type:%u, next_blkoff:%u, blkofs:%u",
+				 i, curseg->segno, curseg->alloc_type,
+				 curseg->next_blkoff, blkofs);
+			return -EINVAL;
+		}
+	}
+	return 0;
 }
 
 /*
