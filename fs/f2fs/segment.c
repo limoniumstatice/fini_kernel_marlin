@@ -2297,6 +2297,8 @@ void write_data_page(struct page *page, struct dnode_of_data *dn,
 
 	if (!IS_DATASEG(get_seg_entry(sbi, segno)->type)) {
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		f2fs_warn(sbi, "%s: incorrect segment(%u) type, run fsck to fix.",
+			  __func__, segno);
 		return -EFAULT;
 	}
 
