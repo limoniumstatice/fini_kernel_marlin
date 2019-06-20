@@ -2019,3 +2019,109 @@ int f2fs_write_inline_data(struct inode *, struct page *, unsigned int);
 void truncate_inline_data(struct inode *, u64);
 bool recover_inline_data(struct inode *, struct page *);
 #endif
+}
+
+static inline bool f2fs_hw_support_discard(struct f2fs_sb_info *sbi)
+{
+	int i;
+
+	if (!f2fs_is_multi_device(sbi))
+		return f2fs_bdev_support_discard(sbi->sb->s_bdev);
+
+	for (i = 0; i < sbi->s_ndevs; i++)
+		if (f2fs_bdev_support_discard(FDEV(i).bdev))
+			return true;
+	return false;
+}
+
+static inline bool f2fs_realtime_discard_enable(struct f2fs_sb_info *sbi)
+{
+	return (test_opt(sbi, DISCARD) && f2fs_hw_support_discard(sbi)) ||
+					f2fs_hw_should_discard(sbi);
+}
+
+static inline bool f2fs_hw_is_readonly(struct f2fs_sb_info *sbi)
+{
+	int i;
+
+	if (!f2fs_is_multi_device(sbi))
+		return bdev_read_only(sbi->sb->s_bdev);
+
+	for (i = 0; i < sbi->s_ndevs; i++)
+		if (bdev_read_only(FDEV(i).bdev))
+			return true;
+	return false;
+}
+
+
+static inline void set_opt_mode(struct f2fs_sb_info *sbi, unsigned int mt)
+{
+	clear_opt(sbi, ADAPTIVE);
+	clear_opt(sbi, LFS);
+
+	switch (mt) {
+	case F2FS_MOUNT_ADAPTIVE:
+		set_opt(sbi, ADAPTIVE);
+		break;
+	case F2FS_MOUNT_LFS:
+		set_opt(sbi, LFS);
+		break;
+	}
+}
+
+static inline bool f2fs_may_encrypt(struct inode *inode)
+{
+#ifdef CONFIG_F2FS_FS_ENCRYPTION
+	umode_t mode = inode->i_mode;
+
+	return (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode));
+#else
+	return false;
+#endif
+}
+
+static inline bool f2fs_force_buffered_io(struct inode *inode, int rw)
+{
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+
+	if (f2fs_post_read_required(inode))
+		return true;
+	if (f2fs_is_multi_device(sbi))
+		return true;
+	/*
+	 * for blkzoned device, fallback direct IO to buffered IO, so
+	 * all IOs can be serialized by log-structured write.
+	 */
+	if (f2fs_sb_has_blkzoned(sbi))
+		return true;
+	if (test_opt(sbi, LFS) && (rw == WRITE))
+		return true;
+	if (is_sbi_flag_set(F2FS_I_SB(inode), SBI_CP_DISABLED))
+		return true;
+
+	return false;
+}
+
+#ifdef CONFIG_F2FS_FAULT_INJECTION
+extern void f2fs_build_fault_attr(struct f2fs_sb_info *sbi, unsigned int rate,
+							unsigned int type);
+#else
+#define f2fs_build_fault_attr(sbi, rate, type)		do { } while (0)
+#endif
+
+static inline bool is_journalled_quota(struct f2fs_sb_info *sbi)
+{
+#ifdef CONFIG_QUOTA
+	if (f2fs_sb_has_quota_ino(sbi))
+		return true;
+	if (F2FS_OPTION(sbi).s_qf_names[USRQUOTA] ||
+		F2FS_OPTION(sbi).s_qf_names[GRPQUOTA])
+		return true;
+#endif
+	return false;
+}
+
+#define EFSBADCRC	EBADMSG		/* Bad CRC detected */
+#define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */
+
+#endif /* _LINUX_F2FS_H */

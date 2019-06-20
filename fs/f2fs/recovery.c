@@ -401,15 +401,55 @@ static int do_recover_data(struct f2fs_sb_info *sbi, struct inode *inode,
 		f2fs_warn(sbi, "Inconsistent ofs_of_node, ino:%lu, ofs:%u, %u",
 			  inode->i_ino, ofs_of_node(dn.node_page),
 			  ofs_of_node(page));
-		err = -EFAULT;
+		err = -EFSCORRUPTED;
 		goto err;
 	}
 
 	for (; start < end; start++, dn.ofs_in_node++) {
 		block_t src, dest;
 
-		src = datablock_addr(dn.node_page, dn.ofs_in_node);
-		dest = datablock_addr(page, dn.ofs_in_node);
+		src = datablock_addr(dn.inode, dn.node_page, dn.ofs_in_node);
+		dest = datablock_addr(dn.inode, page, dn.ofs_in_node);
+
+		if (__is_valid_data_blkaddr(src) &&
+			!f2fs_is_valid_blkaddr(sbi, src, META_POR)) {
+			err = -EFSCORRUPTED;
+			goto err;
+		}
+
+		if (__is_valid_data_blkaddr(dest) &&
+			!f2fs_is_valid_blkaddr(sbi, dest, META_POR)) {
+			err = -EFSCORRUPTED;
+			goto err;
+		}
+
+		/* skip recovering if dest is the same as src */
+		if (src == dest)
+			continue;
+
+		/* dest is invalid, just invalidate src block */
+		if (dest == NULL_ADDR) {
+			f2fs_truncate_data_blocks_range(&dn, 1);
+			continue;
+		}
+
+		if (!file_keep_isize(inode) &&
+			(i_size_read(inode) <= ((loff_t)start << PAGE_SHIFT)))
+			f2fs_i_size_write(inode,
+				(loff_t)(start + 1) << PAGE_SHIFT);
+
+		/*
+		 * dest is reserved block, invalidate src block
+		 * and then reserve one new block in dnode page.
+		 */
+		if (dest == NEW_ADDR) {
+			f2fs_truncate_data_blocks_range(&dn, 1);
+			f2fs_reserve_new_block(&dn);
+			continue;
+		}
+
+		/* dest is valid block, try to recover from src to dest */
+		if (f2fs_is_valid_blkaddr(sbi, dest, META_POR)) {
 
 		if (src != dest && dest != NEW_ADDR && dest != NULL_ADDR) {
 			if (src == NULL_ADDR) {

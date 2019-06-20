@@ -606,7 +606,7 @@ static inline void check_seg_range(struct f2fs_sb_info *sbi, unsigned int segno)
 		f2fs_err(sbi, "Mismatch valid blocks %d vs. %d",
 			 GET_SIT_VBLOCKS(raw_sit), valid_blocks);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
-		return -EINVAL;
+		return -EFSCORRUPTED;
 	}
 
 	/* check segment usage, and check boundary of a given segment number */
@@ -615,7 +615,7 @@ static inline void check_seg_range(struct f2fs_sb_info *sbi, unsigned int segno)
 		f2fs_err(sbi, "Wrong valid blocks %d or segno %u",
 			 GET_SIT_VBLOCKS(raw_sit), segno);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
-		return -EINVAL;
+		return -EFSCORRUPTED;
 	}
 	return 0;
 }
