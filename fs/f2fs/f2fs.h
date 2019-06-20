@@ -262,6 +262,49 @@ static inline bool __has_cursum_space(struct f2fs_summary_block *sum, int size,
 #define F2FS_IOC32_SETFLAGS             FS_IOC32_SETFLAGS
 #endif
 
+struct f2fs_gc_range {
+	u32 sync;
+	u64 start;
+	u64 len;
+};
+
+struct f2fs_defragment {
+	u64 start;
+	u64 len;
+};
+
+struct f2fs_move_range {
+	u32 dst_fd;		/* destination fd */
+	u64 pos_in;		/* start position in src_fd */
+	u64 pos_out;		/* start position in dst_fd */
+	u64 len;		/* size to move */
+};
+
+struct f2fs_flush_device {
+	u32 dev_num;		/* device number to flush */
+	u32 segments;		/* # of segments to flush */
+};
+
+/* for inline stuff */
+#define DEF_INLINE_RESERVED_SIZE	1
+static inline int get_extra_isize(struct inode *inode);
+static inline int get_inline_xattr_addrs(struct inode *inode);
+#define MAX_INLINE_DATA(inode)	(sizeof(__le32) *			\
+				(CUR_ADDRS_PER_INODE(inode) -		\
+				get_inline_xattr_addrs(inode) -	\
+				DEF_INLINE_RESERVED_SIZE))
+
+/* for inline dir */
+#define NR_INLINE_DENTRY(inode)	(MAX_INLINE_DATA(inode) * BITS_PER_BYTE / \
+				((SIZE_OF_DIR_ENTRY + F2FS_SLOT_LEN) * \
+				BITS_PER_BYTE + 1))
+#define INLINE_DENTRY_BITMAP_SIZE(inode) \
+	DIV_ROUND_UP(NR_INLINE_DENTRY(inode), BITS_PER_BYTE)
+#define INLINE_RESERVED_SIZE(inode)	(MAX_INLINE_DATA(inode) - \
+				((SIZE_OF_DIR_ENTRY + F2FS_SLOT_LEN) * \
+				NR_INLINE_DENTRY(inode) + \
+				INLINE_DENTRY_BITMAP_SIZE(inode)))
+
 /*
  * For INODE and NODE manager
  */
