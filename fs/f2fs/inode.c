@@ -51,6 +51,18 @@ static void __get_inode_rdev(struct inode *inode, struct f2fs_inode *ri)
 	}
 }
 
+static int __written_first_block(struct f2fs_sb_info *sbi,
+					struct f2fs_inode *ri)
+{
+	block_t addr = le32_to_cpu(ri->i_addr[offset_in_addr(ri)]);
+
+	if (!__is_valid_data_blkaddr(addr))
+		return 1;
+	if (!f2fs_is_valid_blkaddr(sbi, addr, DATA_GENERIC_ENHANCE))
+		return -EFSCORRUPTED;
+	return 0;
+}
+
 static void __set_inode_rdev(struct inode *inode, struct f2fs_inode *ri)
 {
 	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
@@ -302,8 +314,44 @@ static int do_read_inode(struct inode *inode)
 	fi->i_pino = le32_to_cpu(ri->i_pino);
 	fi->i_dir_level = ri->i_dir_level;
 
-	get_extent_info(&fi->ext, ri->i_ext);
-	get_inline_info(fi, ri);
+	if (f2fs_init_extent_tree(inode, &ri->i_ext))
+		set_page_dirty(node_page);
+
+	get_inline_info(inode, ri);
+
+	fi->i_extra_isize = f2fs_has_extra_attr(inode) ?
+					le16_to_cpu(ri->i_extra_isize) : 0;
+
+	if (f2fs_sb_has_flexible_inline_xattr(sbi)) {
+		fi->i_inline_xattr_size = le16_to_cpu(ri->i_inline_xattr_size);
+	} else if (f2fs_has_inline_xattr(inode) ||
+				f2fs_has_inline_dentry(inode)) {
+		fi->i_inline_xattr_size = DEFAULT_INLINE_XATTR_ADDRS;
+	} else {
+
+		/*
+		 * Previous inline data or directory always reserved 200 bytes
+		 * in inode layout, even if inline_xattr is disabled. In order
+		 * to keep inline_dentry's structure for backward compatibility,
+		 * we get the space back only from inline_data.
+		 */
+		fi->i_inline_xattr_size = 0;
+	}
+
+	if (!sanity_check_inode(inode, node_page)) {
+		f2fs_put_page(node_page, 1);
+		return -EFSCORRUPTED;
+	}
+
+	/* check data exist */
+	if (f2fs_has_inline_data(inode) && !f2fs_exist_data(inode))
+		__recover_inline_status(inode, node_page);
+
+	/* try to recover cold bit for non-dir inode */
+	if (!S_ISDIR(inode->i_mode) && !is_cold_node(node_page)) {
+		set_cold_node(node_page, false);
+		set_page_dirty(node_page);
+	}
 
 	/* get rdev by using inline_info */
 	__get_inode_rdev(inode, ri);

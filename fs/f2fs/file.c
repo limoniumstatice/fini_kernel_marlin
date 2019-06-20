@@ -754,9 +754,12 @@ static int expand_inode_data(struct inode *inode, loff_t offset,
 	if (ret)
 		return ret;
 
-	ret = f2fs_convert_inline_data(inode, offset + len, NULL);
-	if (ret)
-		return ret;
+		if (__is_valid_data_blkaddr(*blkaddr) &&
+			!f2fs_is_valid_blkaddr(sbi, *blkaddr,
+					DATA_GENERIC_ENHANCE)) {
+			f2fs_put_dnode(&dn);
+			return -EFSCORRUPTED;
+		}
 
 	pg_start = ((unsigned long long) offset) >> PAGE_CACHE_SHIFT;
 	pg_end = ((unsigned long long) offset + len) >> PAGE_CACHE_SHIFT;
