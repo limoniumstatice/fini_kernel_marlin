@@ -622,6 +622,181 @@ static void move_data_page(struct inode *inode, struct page *page, int gc_type)
 		.type = DATA,
 		.rw = WRITE_SYNC,
 	};
+	struct dnode_of_data dn;
+	struct f2fs_summary sum;
+	struct node_info ni;
+	struct page *page, *mpage;
+	block_t newaddr;
+	int err = 0;
+	bool lfs_mode = test_opt(fio.sbi, LFS);
+
+	/* do not read out */
+	page = f2fs_grab_cache_page(inode->i_mapping, bidx, false);
+	if (!page)
+		return -ENOMEM;
+
+	if (!check_valid_map(F2FS_I_SB(inode), segno, off)) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	if (f2fs_is_atomic_file(inode)) {
+		F2FS_I(inode)->i_gc_failures[GC_FAILURE_ATOMIC]++;
+		F2FS_I_SB(inode)->skipped_atomic_files[gc_type]++;
+		err = -EAGAIN;
+		goto out;
+	}
+
+	if (f2fs_is_pinned_file(inode)) {
+		f2fs_pin_file_control(inode, true);
+		err = -EAGAIN;
+		goto out;
+	}
+
+	set_new_dnode(&dn, inode, NULL, NULL, 0);
+	err = f2fs_get_dnode_of_data(&dn, bidx, LOOKUP_NODE);
+	if (err)
+		goto out;
+
+	if (unlikely(dn.data_blkaddr == NULL_ADDR)) {
+		ClearPageUptodate(page);
+		err = -ENOENT;
+		goto put_out;
+	}
+
+	/*
+	 * don't cache encrypted data into meta inode until previous dirty
+	 * data were writebacked to avoid racing between GC and flush.
+	 */
+	f2fs_wait_on_page_writeback(page, DATA, true, true);
+
+	f2fs_wait_on_block_writeback(inode, dn.data_blkaddr);
+
+	err = f2fs_get_node_info(fio.sbi, dn.nid, &ni);
+	if (err)
+		goto put_out;
+
+	set_summary(&sum, dn.nid, dn.ofs_in_node, ni.version);
+
+	/* read page */
+	fio.page = page;
+	fio.new_blkaddr = fio.old_blkaddr = dn.data_blkaddr;
+
+	if (lfs_mode)
+		down_write(&fio.sbi->io_order_lock);
+
+	mpage = f2fs_grab_cache_page(META_MAPPING(fio.sbi),
+					fio.old_blkaddr, false);
+	if (!mpage)
+		goto up_out;
+
+	fio.encrypted_page = mpage;
+
+	/* read source block in mpage */
+	if (!PageUptodate(mpage)) {
+		err = f2fs_submit_page_bio(&fio);
+		if (err) {
+			f2fs_put_page(mpage, 1);
+			goto up_out;
+		}
+		lock_page(mpage);
+		if (unlikely(mpage->mapping != META_MAPPING(fio.sbi) ||
+						!PageUptodate(mpage))) {
+			err = -EIO;
+			f2fs_put_page(mpage, 1);
+			goto up_out;
+		}
+	}
+
+	f2fs_allocate_data_block(fio.sbi, NULL, fio.old_blkaddr, &newaddr,
+					&sum, CURSEG_COLD_DATA, NULL, false);
+
+	fio.encrypted_page = f2fs_pagecache_get_page(META_MAPPING(fio.sbi),
+				newaddr, FGP_LOCK | FGP_CREAT, GFP_NOFS);
+	if (!fio.encrypted_page) {
+		err = -ENOMEM;
+		f2fs_put_page(mpage, 1);
+		goto recover_block;
+	}
+
+	/* write target block */
+	f2fs_wait_on_page_writeback(fio.encrypted_page, DATA, true, true);
+	memcpy(page_address(fio.encrypted_page),
+				page_address(mpage), PAGE_SIZE);
+	f2fs_put_page(mpage, 1);
+	invalidate_mapping_pages(META_MAPPING(fio.sbi),
+				fio.old_blkaddr, fio.old_blkaddr);
+
+	set_page_dirty(fio.encrypted_page);
+	if (clear_page_dirty_for_io(fio.encrypted_page))
+		dec_page_count(fio.sbi, F2FS_DIRTY_META);
+
+	set_page_writeback(fio.encrypted_page);
+	ClearPageError(page);
+
+	/* allocate block address */
+	f2fs_wait_on_page_writeback(dn.node_page, NODE, true, true);
+
+	fio.op = REQ_OP_WRITE;
+	fio.op_flags = REQ_SYNC;
+	fio.new_blkaddr = newaddr;
+	f2fs_submit_page_write(&fio);
+	if (fio.retry) {
+		err = -EAGAIN;
+		if (PageWriteback(fio.encrypted_page))
+			end_page_writeback(fio.encrypted_page);
+		goto put_page_out;
+	}
+
+	f2fs_update_iostat(fio.sbi, FS_GC_DATA_IO, F2FS_BLKSIZE);
+
+	f2fs_update_data_blkaddr(&dn, newaddr);
+	set_inode_flag(inode, FI_APPEND_WRITE);
+	if (page->index == 0)
+		set_inode_flag(inode, FI_FIRST_BLOCK_WRITTEN);
+put_page_out:
+	f2fs_put_page(fio.encrypted_page, 1);
+recover_block:
+	if (err)
+		f2fs_do_replace_block(fio.sbi, &sum, newaddr, fio.old_blkaddr,
+								true, true);
+up_out:
+	if (lfs_mode)
+		up_write(&fio.sbi->io_order_lock);
+put_out:
+	f2fs_put_dnode(&dn);
+out:
+	f2fs_put_page(page, 1);
+	return err;
+}
+
+static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
+							unsigned int segno, int off)
+{
+	struct page *page;
+	int err = 0;
+
+	page = f2fs_get_lock_data_page(inode, bidx, true);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+
+	if (!check_valid_map(F2FS_I_SB(inode), segno, off)) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	if (f2fs_is_atomic_file(inode)) {
+		F2FS_I(inode)->i_gc_failures[GC_FAILURE_ATOMIC]++;
+		F2FS_I_SB(inode)->skipped_atomic_files[gc_type]++;
+		err = -EAGAIN;
+		goto out;
+	}
+	if (f2fs_is_pinned_file(inode)) {
+		if (gc_type == FG_GC)
+			f2fs_pin_file_control(inode, true);
+		err = -EAGAIN;
+		goto out;
+	}
 
 	if (gc_type == BG_GC) {
 		if (PageWriteback(page))
