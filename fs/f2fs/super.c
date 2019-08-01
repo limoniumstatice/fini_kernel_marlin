@@ -53,6 +53,42 @@ enum {
 	Opt_inline_data,
 	Opt_flush_merge,
 	Opt_nobarrier,
+	Opt_fastboot,
+	Opt_extent_cache,
+	Opt_noextent_cache,
+	Opt_noinline_data,
+	Opt_data_flush,
+	Opt_reserve_root,
+	Opt_resgid,
+	Opt_resuid,
+	Opt_mode,
+	Opt_io_size_bits,
+	Opt_fault_injection,
+	Opt_fault_type,
+	Opt_lazytime,
+	Opt_nolazytime,
+	Opt_quota,
+	Opt_noquota,
+	Opt_usrquota,
+	Opt_grpquota,
+	Opt_prjquota,
+	Opt_usrjquota,
+	Opt_grpjquota,
+	Opt_prjjquota,
+	Opt_offusrjquota,
+	Opt_offgrpjquota,
+	Opt_offprjjquota,
+	Opt_jqfmt_vfsold,
+	Opt_jqfmt_vfsv0,
+	Opt_jqfmt_vfsv1,
+	Opt_whint,
+	Opt_alloc,
+	Opt_fsync,
+	Opt_test_dummy_encryption,
+	Opt_checkpoint_disable,
+	Opt_checkpoint_disable_cap,
+	Opt_checkpoint_disable_cap_perc,
+	Opt_checkpoint_enable,
 	Opt_err,
 };
 
@@ -71,6 +107,42 @@ static match_table_t f2fs_tokens = {
 	{Opt_inline_data, "inline_data"},
 	{Opt_flush_merge, "flush_merge"},
 	{Opt_nobarrier, "nobarrier"},
+	{Opt_fastboot, "fastboot"},
+	{Opt_extent_cache, "extent_cache"},
+	{Opt_noextent_cache, "noextent_cache"},
+	{Opt_noinline_data, "noinline_data"},
+	{Opt_data_flush, "data_flush"},
+	{Opt_reserve_root, "reserve_root=%u"},
+	{Opt_resgid, "resgid=%u"},
+	{Opt_resuid, "resuid=%u"},
+	{Opt_mode, "mode=%s"},
+	{Opt_io_size_bits, "io_bits=%u"},
+	{Opt_fault_injection, "fault_injection=%u"},
+	{Opt_fault_type, "fault_type=%u"},
+	{Opt_lazytime, "lazytime"},
+	{Opt_nolazytime, "nolazytime"},
+	{Opt_quota, "quota"},
+	{Opt_noquota, "noquota"},
+	{Opt_usrquota, "usrquota"},
+	{Opt_grpquota, "grpquota"},
+	{Opt_prjquota, "prjquota"},
+	{Opt_usrjquota, "usrjquota=%s"},
+	{Opt_grpjquota, "grpjquota=%s"},
+	{Opt_prjjquota, "prjjquota=%s"},
+	{Opt_offusrjquota, "usrjquota="},
+	{Opt_offgrpjquota, "grpjquota="},
+	{Opt_offprjjquota, "prjjquota="},
+	{Opt_jqfmt_vfsold, "jqfmt=vfsold"},
+	{Opt_jqfmt_vfsv0, "jqfmt=vfsv0"},
+	{Opt_jqfmt_vfsv1, "jqfmt=vfsv1"},
+	{Opt_whint, "whint_mode=%s"},
+	{Opt_alloc, "alloc_mode=%s"},
+	{Opt_fsync, "fsync_mode=%s"},
+	{Opt_test_dummy_encryption, "test_dummy_encryption"},
+	{Opt_checkpoint_disable, "checkpoint=disable"},
+	{Opt_checkpoint_disable_cap, "checkpoint=disable:%u"},
+	{Opt_checkpoint_disable_cap_perc, "checkpoint=disable:%u%%"},
+	{Opt_checkpoint_enable, "checkpoint=enable"},
 	{Opt_err, NULL},
 };
 
@@ -2128,6 +2200,12 @@ static int sanity_check_raw_super(struct super_block *sb,
 	size_t crc_offset = 0;
 	__u32 crc = 0;
 
+	if (le32_to_cpu(raw_super->magic) != F2FS_SUPER_MAGIC) {
+		f2fs_info(sbi, "Magic Mismatch, valid(0x%x) - read(0x%x)",
+			  F2FS_SUPER_MAGIC, le32_to_cpu(raw_super->magic));
+		return -EINVAL;
+	}
+
 	/* Check checksum_offset and crc in superblock */
 	if (__F2FS_HAS_FEATURE(raw_super, F2FS_FEATURE_SB_CHKSUM)) {
 		crc_offset = le32_to_cpu(raw_super->checksum_offset);
@@ -2135,26 +2213,20 @@ static int sanity_check_raw_super(struct super_block *sb,
 			offsetof(struct f2fs_super_block, crc)) {
 			f2fs_info(sbi, "Invalid SB checksum offset: %zu",
 				  crc_offset);
-			return 1;
+			return -EFSCORRUPTED;
 		}
 		crc = le32_to_cpu(raw_super->crc);
 		if (!f2fs_crc_valid(sbi, crc, raw_super, crc_offset)) {
 			f2fs_info(sbi, "Invalid SB checksum value: %u", crc);
-			return 1;
+			return -EFSCORRUPTED;
 		}
-	}
-
-	if (F2FS_SUPER_MAGIC != le32_to_cpu(raw_super->magic)) {
-		f2fs_info(sbi, "Magic Mismatch, valid(0x%x) - read(0x%x)",
-			  F2FS_SUPER_MAGIC, le32_to_cpu(raw_super->magic));
-		return 1;
 	}
 
 	/* Currently, support only 4KB page cache size */
 	if (F2FS_BLKSIZE != PAGE_SIZE) {
 		f2fs_info(sbi, "Invalid page_cache_size (%lu), supports only 4KB",
 			  PAGE_SIZE);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	/* Currently, support only 4KB block size */
@@ -2162,14 +2234,14 @@ static int sanity_check_raw_super(struct super_block *sb,
 	if (blocksize != F2FS_BLKSIZE) {
 		f2fs_info(sbi, "Invalid blocksize (%u), supports only 4KB",
 			  blocksize);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	/* check log blocks per segment */
 	if (le32_to_cpu(raw_super->log_blocks_per_seg) != 9) {
 		f2fs_info(sbi, "Invalid log blocks per segment (%u)",
 			  le32_to_cpu(raw_super->log_blocks_per_seg));
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	/* Currently, support 512/1024/2048/4096 bytes sector size */
@@ -2179,7 +2251,7 @@ static int sanity_check_raw_super(struct super_block *sb,
 				F2FS_MIN_LOG_SECTOR_SIZE) {
 		f2fs_info(sbi, "Invalid log sectorsize (%u)",
 			  le32_to_cpu(raw_super->log_sectorsize));
-		return 1;
+		return -EFSCORRUPTED;
 	}
 	if (le32_to_cpu(raw_super->log_sectors_per_block) +
 		le32_to_cpu(raw_super->log_sectorsize) !=
@@ -2187,7 +2259,7 @@ static int sanity_check_raw_super(struct super_block *sb,
 		f2fs_info(sbi, "Invalid log sectors per block(%u) log sectorsize(%u)",
 			  le32_to_cpu(raw_super->log_sectors_per_block),
 			  le32_to_cpu(raw_super->log_sectorsize));
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	segment_count = le32_to_cpu(raw_super->segment_count);
@@ -2201,7 +2273,7 @@ static int sanity_check_raw_super(struct super_block *sb,
 	if (segment_count > F2FS_MAX_SEGMENT ||
 				segment_count < F2FS_MIN_SEGMENTS) {
 		f2fs_info(sbi, "Invalid segment count (%u)", segment_count);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	if (total_sections > segment_count ||
@@ -2209,25 +2281,25 @@ static int sanity_check_raw_super(struct super_block *sb,
 			segs_per_sec > segment_count || !segs_per_sec) {
 		f2fs_info(sbi, "Invalid segment/section count (%u, %u x %u)",
 			  segment_count, total_sections, segs_per_sec);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	if ((segment_count / segs_per_sec) < total_sections) {
 		f2fs_info(sbi, "Small segment_count (%u < %u * %u)",
 			  segment_count, segs_per_sec, total_sections);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	if (segment_count > (le64_to_cpu(raw_super->block_count) >> 9)) {
 		f2fs_info(sbi, "Wrong segment_count / block_count (%u > %llu)",
 			  segment_count, le64_to_cpu(raw_super->block_count));
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	if (secs_per_zone > total_sections || !secs_per_zone) {
 		f2fs_info(sbi, "Wrong secs_per_zone / total_sections (%u, %u)",
 			  secs_per_zone, total_sections);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 	if (le32_to_cpu(raw_super->extension_count) > F2FS_MAX_EXTENSION ||
 			raw_super->hot_ext_count > F2FS_MAX_EXTENSION ||
@@ -2237,7 +2309,7 @@ static int sanity_check_raw_super(struct super_block *sb,
 			  le32_to_cpu(raw_super->extension_count),
 			  raw_super->hot_ext_count,
 			  F2FS_MAX_EXTENSION);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	if (le32_to_cpu(raw_super->cp_payload) >
@@ -2245,7 +2317,7 @@ static int sanity_check_raw_super(struct super_block *sb,
 		f2fs_info(sbi, "Insane cp_payload (%u > %u)",
 			  le32_to_cpu(raw_super->cp_payload),
 			  blocks_per_seg - F2FS_CP_PACKS);
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	/* check reserved ino info */
@@ -2256,19 +2328,12 @@ static int sanity_check_raw_super(struct super_block *sb,
 			  le32_to_cpu(raw_super->node_ino),
 			  le32_to_cpu(raw_super->meta_ino),
 			  le32_to_cpu(raw_super->root_ino));
-		return 1;
-	}
-
-	if (le32_to_cpu(raw_super->segment_count) > F2FS_MAX_SEGMENT) {
-		f2fs_msg(sb, KERN_INFO,
-			"Invalid segment count (%u)",
-			le32_to_cpu(raw_super->segment_count));
-		return 1;
+		return -EFSCORRUPTED;
 	}
 
 	/* check CP/SIT/NAT/SSA/MAIN_AREA area boundary */
-	if (sanity_check_area_boundary(sb, raw_super))
-		return 1;
+	if (sanity_check_area_boundary(sbi, bh))
+		return -EFSCORRUPTED;
 
 	return 0;
 }
@@ -2470,10 +2535,10 @@ static int read_raw_super_block(struct super_block *sb,
 		}
 
 		/* sanity checking of raw super */
-		if (sanity_check_raw_super(sbi, bh)) {
+		err = sanity_check_raw_super(sbi, bh);
+		if (err) {
 			f2fs_err(sbi, "Can't find valid F2FS filesystem in %dth superblock",
 				 block + 1);
-			err = -EFSCORRUPTED;
 			brelse(bh);
 			continue;
 		}
@@ -2708,9 +2773,19 @@ try_onemore:
 	sbi->total_valid_block_count =
 				le64_to_cpu(sbi->ckpt->valid_block_count);
 	sbi->last_valid_block_count = sbi->total_valid_block_count;
-	sbi->alloc_valid_block_count = 0;
-	INIT_LIST_HEAD(&sbi->dir_inode_list);
-	spin_lock_init(&sbi->dir_inode_lock);
+	sbi->reserved_blocks = 0;
+	sbi->current_reserved_blocks = 0;
+	limit_reserve_root(sbi);
+
+	for (i = 0; i < NR_INODE_TYPE; i++) {
+		INIT_LIST_HEAD(&sbi->inode_list[i]);
+		spin_lock_init(&sbi->inode_lock[i]);
+	}
+	mutex_init(&sbi->flush_lock);
+
+	f2fs_init_extent_cache_info(sbi);
+
+	f2fs_init_ino_entry_info(sbi);
 
 	init_ino_entry_info(sbi);
 

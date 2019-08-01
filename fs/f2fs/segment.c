@@ -246,9 +246,44 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi)
 
 void f2fs_balance_fs_bg(struct f2fs_sb_info *sbi)
 {
-	/* check the # of cached NAT entries and prefree segments */
-	if (try_to_free_nats(sbi, NAT_ENTRY_PER_BLOCK) ||
-				excess_prefree_segs(sbi))
+	if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
+		return;
+
+	/* try to shrink extent cache when there is no enough memory */
+	if (!f2fs_available_free_memory(sbi, EXTENT_CACHE))
+		f2fs_shrink_extent_tree(sbi, EXTENT_CACHE_SHRINK_NUMBER);
+
+	/* check the # of cached NAT entries */
+	if (!f2fs_available_free_memory(sbi, NAT_ENTRIES))
+		f2fs_try_to_free_nats(sbi, NAT_ENTRY_PER_BLOCK);
+
+	if (!f2fs_available_free_memory(sbi, FREE_NIDS))
+		f2fs_try_to_free_nids(sbi, MAX_FREE_NIDS);
+	else
+		f2fs_build_free_nids(sbi, false, false);
+
+	if (!is_idle(sbi, REQ_TIME) &&
+		(!excess_dirty_nats(sbi) && !excess_dirty_nodes(sbi)))
+		return;
+
+	/* checkpoint is the only way to shrink partial cached entries */
+	if (!f2fs_available_free_memory(sbi, NAT_ENTRIES) ||
+			!f2fs_available_free_memory(sbi, INO_ENTRIES) ||
+			excess_prefree_segs(sbi) ||
+			excess_dirty_nats(sbi) ||
+			excess_dirty_nodes(sbi) ||
+			f2fs_time_over(sbi, CP_TIME)) {
+		if (test_opt(sbi, DATA_FLUSH)) {
+			struct blk_plug plug;
+
+			mutex_lock(&sbi->flush_lock);
+
+			blk_start_plug(&plug);
+			f2fs_sync_dirty_inodes(sbi, FILE_INODE);
+			blk_finish_plug(&plug);
+
+			mutex_unlock(&sbi->flush_lock);
+		}
 		f2fs_sync_fs(sbi->sb, true);
 }
 
@@ -2117,6 +2152,38 @@ unlock:
 
 void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi)
 {
+	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	unsigned int segno;
+
+	down_read(&SM_I(sbi)->curseg_lock);
+	mutex_lock(&curseg->curseg_mutex);
+	down_write(&SIT_I(sbi)->sentry_lock);
+
+	segno = CURSEG_I(sbi, type)->segno;
+	if (segno < start || segno > end)
+		goto unlock;
+
+	if (f2fs_need_SSR(sbi) && get_ssr_segment(sbi, type))
+		change_curseg(sbi, type);
+	else
+		new_curseg(sbi, type, true);
+
+	stat_inc_seg_type(sbi, curseg);
+
+	locate_dirty_segment(sbi, segno);
+unlock:
+	up_write(&SIT_I(sbi)->sentry_lock);
+
+	if (segno != curseg->segno)
+		f2fs_notice(sbi, "For resize: curseg of type %d: %u ==> %u",
+			    type, segno, curseg->segno);
+
+	mutex_unlock(&curseg->curseg_mutex);
+	up_read(&SM_I(sbi)->curseg_lock);
+}
+
+void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi)
+{
 	struct curseg_info *curseg;
 	unsigned int old_curseg;
 	int i;
@@ -2359,7 +2426,18 @@ int f2fs_inplace_write_data(struct f2fs_io_info *fio)
 		return -EFSCORRUPTED;
 	}
 
-	do_write_page(sbi, page, dn->data_blkaddr, new_blkaddr, &sum, fio);
+	stat_inc_inplace_blocks(fio->sbi);
+
+	if (fio->bio)
+		err = f2fs_merge_page_bio(fio);
+	else
+		err = f2fs_submit_page_bio(fio);
+	if (!err) {
+		update_device_state(fio);
+		f2fs_update_iostat(fio->sbi, fio->io_type, F2FS_BLKSIZE);
+	}
+
+	return err;
 }
 
 void rewrite_data_page(struct page *page, block_t old_blkaddr,
@@ -3374,6 +3452,10 @@ int build_segment_manager(struct f2fs_sb_info *sbi)
 
 	init_free_segmap(sbi);
 	err = build_dirty_segmap(sbi);
+	if (err)
+		return err;
+
+	err = sanity_check_curseg(sbi);
 	if (err)
 		return err;
 
