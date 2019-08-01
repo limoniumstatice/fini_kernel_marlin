@@ -187,6 +187,13 @@ static unsigned char *__struct_ptr(struct f2fs_sb_info *sbi, int struct_type)
 					   F2FS_OPTION(sbi).s_resgid));
 }
 
+static void init_once(void *foo)
+{
+	struct f2fs_inode_info *fi = (struct f2fs_inode_info *) foo;
+
+	inode_init_once(&fi->vfs_inode);
+}
+
 static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 			struct f2fs_sb_info *sbi, char *buf)
 {
@@ -942,6 +949,10 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 		seq_puts(seq, ",disable_roll_forward");
 	if (test_opt(sbi, DISCARD))
 		seq_puts(seq, ",discard");
+	else
+		seq_puts(seq, ",nodiscard");
+	if (test_opt(sbi, NOHEAP))
+		seq_puts(seq, ",no_heap");
 	else
 		seq_puts(seq, ",nodiscard");
 	if (test_opt(sbi, NOHEAP))
@@ -2044,13 +2055,6 @@ static int sanity_check_raw_super(struct super_block *sb,
 			  le32_to_cpu(raw_super->meta_ino),
 			  le32_to_cpu(raw_super->root_ino));
 		return -EFSCORRUPTED;
-	}
-
-	if (le32_to_cpu(raw_super->segment_count) > F2FS_MAX_SEGMENT) {
-		f2fs_msg(sb, KERN_INFO,
-			"Invalid segment count (%u)",
-			le32_to_cpu(raw_super->segment_count));
-		return 1;
 	}
 
 	/* check CP/SIT/NAT/SSA/MAIN_AREA area boundary */
