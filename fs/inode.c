@@ -18,6 +18,7 @@
 #include <linux/buffer_head.h> /* for inode_has_buffers */
 #include <linux/ratelimit.h>
 #include <linux/list_lru.h>
+#include <trace/events/writeback.h>
 #include "internal.h"
 
 /*
@@ -30,7 +31,7 @@
  * inode_sb_list_lock protects:
  *   sb->s_inodes, inode->i_sb_list
  * bdi->wb.list_lock protects:
- *   bdi->wb.b_{dirty,io,more_io}, inode->i_wb_list
+ *   bdi->wb.b_{dirty,io,more_io,dirty_time}, inode->i_wb_list
  * inode_hash_lock protects:
  *   inode_hashtable, inode->i_hash
  *
@@ -419,7 +420,6 @@ void inode_add_lru(struct inode *inode)
 		inode_lru_list_add(inode);
 }
 
-
 static void inode_lru_list_del(struct inode *inode)
 {
 
@@ -621,6 +621,7 @@ void evict_inodes(struct super_block *sb)
 
 	dispose_list(&dispose);
 }
+EXPORT_SYMBOL_GPL(evict_inodes);
 
 /**
  * invalidate_inodes	- attempt to free all inodes on a superblock
@@ -1939,27 +1940,9 @@ void inode_set_flags(struct inode *inode, unsigned int flags,
 }
 EXPORT_SYMBOL(inode_set_flags);
 
-/*
- * Generic function to check FS_IOC_SETFLAGS values and reject any invalid
- * configurations.
- *
- * Note: the caller should be holding i_mutex, or else be sure that they have
- * exclusive access to the inode structure.
- */
-int vfs_ioc_setflags_prepare(struct inode *inode, unsigned int oldflags,
-			     unsigned int flags)
+void inode_nohighmem(struct inode *inode)
 {
-	/*
-	 * The IMMUTABLE and APPEND_ONLY flags can only be changed by
-	 * the relevant capability.
-	 *
-	 * This test looks nicer. Thanks to Pauline Middelink
-	 */
-	if ((flags ^ oldflags) & (FS_APPEND_FL | FS_IMMUTABLE_FL) &&
-	    !capable(CAP_LINUX_IMMUTABLE))
-		return -EPERM;
-
-	return 0;
+	mapping_set_gfp_mask(inode->i_mapping, GFP_USER);
 }
 EXPORT_SYMBOL(inode_nohighmem);
 
