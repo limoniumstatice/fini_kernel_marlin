@@ -4332,7 +4332,7 @@ flash_prog_mode:
 static int synaptics_rmi4_gpio_setup(int gpio, bool config, int dir, int state)
 {
 	int retval = 0;
-	unsigned char buf[16];
+	unsigned char buf[4096];
 
 	if (config) {
 		snprintf(buf, PAGE_SIZE, "dsx_gpio_%u\n", gpio);
